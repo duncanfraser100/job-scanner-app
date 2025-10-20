@@ -1,16 +1,17 @@
-FROM mcr.microsoft.com/devcontainers/python:3.11
-
-RUN apt-get update && apt-get install -y wget gnupg --no-install-recommends && \
-    rm -rf /var/lib/apt/lists/*
+# Includes Python + Playwright + Chromium + system deps
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
 WORKDIR /app
-COPY requirements.txt ./
+
+# Your Python deps
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright + browser
-RUN pip install --no-cache-dir playwright==1.48.0 && \
-    playwright install --with-deps chromium
-
+# App code
 COPY . .
+
 ENV PYTHONUNBUFFERED=1
+
+# entrypoint
 CMD ["python", "main.py"]
+

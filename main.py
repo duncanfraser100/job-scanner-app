@@ -7,6 +7,7 @@ from dateutil import parser as dp
 
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 # -------- Config from env --------
 CITY_FILTER = os.getenv("CITY_FILTER", "SYDNEY").lower()
@@ -151,13 +152,35 @@ def to_html_table(df: pd.DataFrame, report_title: str):
     header = f"<h2>{report_title}</h2>"
     return header + df.to_html(index=False, escape=False)
 
-def upload_with_msi(local_bytes: bytes, path: str, content_type="text/csv"):
+def upload_with_msi(local_bytes: bytes, path: str, content_type: str = "text/csv"):
+    """
+    Uploads bytes to Azure Blob Storage using Managed Identity auth.
+    - Creates the container if it doesn't exist (idempotent).
+    - Sets the correct Content-Type header.
+    """
+    if not STORAGE_ACCOUNT_NAME:
+        raise RuntimeError("STORAGE_ACCOUNT_NAME is not set")
+    if not STORAGE_CONTAINER:
+        raise RuntimeError("STORAGE_CONTAINER is not set")
+
     cred = DefaultAzureCredential()
-    url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
-    bsc = BlobServiceClient(account_url=url, credential=cred)
+    account_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+    bsc = BlobServiceClient(account_url=account_url, credential=cred)
+
+    # Ensure container exists (safe to call repeatedly)
     container = bsc.get_container_client(STORAGE_CONTAINER)
+    try:
+        container.create_container()  # no-op if it already exists
+    except Exception:
+        pass
+
     blob = container.get_blob_client(path)
-    blob.upload_blob(local_bytes, overwrite=True, content_settings={"content_type":content_type})
+
+    # IMPORTANT: ContentSettings, not a dict
+    cs = ContentSettings(content_type=content_type)
+
+    # Upload (overwrite enabled)
+    blob.upload_blob(local_bytes, overwrite=True, content_settings=cs)
 
 def main():
     all_rows=[]
@@ -192,7 +215,7 @@ def main():
     csv_bytes = df.to_csv(index=False).encode("utf-8") if not df.empty else b""
     html_bytes = to_html_table(df, title).encode("utf-8") if not df.empty else "<p>No matching roles today.</p>".encode("utf-8")
 
-    upload_with_msi(csv_bytes, csv_name, content_type="text/csv")
+    upload_with_msi(csv_bytes,  csv_name,  content_type="text/csv")
     upload_with_msi(html_bytes, html_name, content_type="text/html")
 
     # Optional: send email **directly** from container (if you don’t want Logic App doing email)
@@ -220,3 +243,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

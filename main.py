@@ -1,9 +1,9 @@
 # --- DEBUG LOGGER ------------------------------------------------------------
 import json, sys
-from datetime import datetime
+from datetime import datetime as _dt
 
 def dbg(msg, obj=None):
-    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    ts = _dt.utcnow().isoformat(timespec="seconds") + "Z"
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     if obj is not None:
@@ -13,7 +13,7 @@ def dbg(msg, obj=None):
             print(str(obj)[:4000], flush=True)
 # ----------------------------------------------------------------------------
 
-import os, io, hashlib, re
+import os, io, hashlib, re, random
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 
@@ -23,8 +23,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0 (JobScan/1.0)"})
-_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 JobScan/1.0"})
+_retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
 SESSION.mount("http://", HTTPAdapter(max_retries=_retry))
 SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
 
@@ -34,7 +34,7 @@ from dateutil import parser as dp
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-# =========================== CONFIG FROM ENV ================================
+# =========================== CONFIG FROM ENV =================================
 CITY_FILTER = os.getenv("CITY_FILTER", "SYDNEY").lower()
 TIME_WINDOW_DAYS = int(os.getenv("TIME_WINDOW_DAYS", "7"))
 REPORT_PREFIX = os.getenv("REPORT_PREFIX", "jobs_report")
@@ -63,7 +63,7 @@ dbg("[CFG] starting run", {
     "tech_pref": ALIGNMENT_TECH_PREF,
     "sector_priority": SECTOR_PRIORITY
 })
-# ===========================================================================
+# ============================================================================
 
 def http_get(url, headers=None):
     dbg("[HTTP] GET", {"url": url})
@@ -72,18 +72,18 @@ def http_get(url, headers=None):
     r.raise_for_status()
     return r
 
-def normalize_text(t): 
+def normalize_text(t):
     return re.sub(r"\s+"," ", t or "").strip()
 
 def parse_date_guess(s):
-    if not s: 
+    if not s:
         return None
     try:
         dt = dp.parse(s, dayfirst=False, yearfirst=False)
-        if not dt.tzinfo: 
+        if not dt.tzinfo:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
-    except: 
+    except:
         return None
 
 def in_sydney_scope(city_text):
@@ -136,7 +136,8 @@ def row(role, company, source_url, posted_dt, engagement, status, sector, ration
         "Alignment Score (1–10)": score
     }
 
-# ----------------------- SCRAPERS (MVP versions) ----------------------------
+# ----------------------- SCRAPERS (MVP + direct) -----------------------------
+
 def scrape_seek():
     url = ("https://www.seek.com.au/jobs"
            "?where=Sydney&keywords=head%20of%20data%20OR%20head%20of%20analytics%20"
@@ -156,14 +157,13 @@ def scrape_seek():
         full = "https://www.seek.com.au" + href if href.startswith("/") else href
         if not title_hits(title):
             continue
-        posted_dt = UTC_NOW  # page often needs detail click; assume fresh
+        posted_dt = UTC_NOW  # assume fresh without detail click
         if posted_dt < SINCE:
             continue
         sector = "edge-case/other"
         score = alignment_score(title, "", sector, posted_dt)
         out.append(row(title, "Seek Listing", full, posted_dt, engagement_type(title), "Active", sector,
                        "Title match; Sydney search", score))
-
     dbg("[SEEK] final rows", {"count": len(out)})
     return out
 
@@ -193,15 +193,10 @@ def scrape_indeed():
         score = alignment_score(title, "", sector, posted_dt)
         out.append(row(title, "Indeed Listing", full, posted_dt, engagement_type(title), "Active", sector,
                        "Title match; Sydney search", score))
-
     dbg("[INDEED] final rows", {"count": len(out)})
     return out
 
 def _parse_seek_listed_to_dt(text: str):
-    """
-    Convert strings like 'Listed 2 days ago', 'Listed 1 day ago', 'Listed today', 'Just posted'
-    into an approximate datetime in UTC. If unknown, return UTC_NOW.
-    """
     t = (text or "").lower()
     try:
         if "just" in t or "today" in t:
@@ -214,25 +209,32 @@ def _parse_seek_listed_to_dt(text: str):
         pass
     return UTC_NOW
 
+def _report_folder():
+    return f"{REPORT_PREFIX}/{UTC_NOW.strftime('%Y-%m-%d')}"
+
 def scrape_seek_direct():
     """
-    Loads a FULL SEEK search URL (provided via SEEK_URL) with Playwright and parses cards.
-    Works on URLs like:
-      https://www.seek.com.au/head-of-data-jobs/in-All-Sydney-NSW?daterange=3&tags=new
-    Notes:
-      - We don’t click into detail pages (keeps it fast & less bot-like).
-      - We try several common selectors; SEEK tweaks markup often.
+    Load a *full* SEEK search URL via Playwright and parse listing cards.
+    If blocked/empty, uploads seek_screenshot.png to the report folder for diagnosis.
     """
     if not SEEK_URL:
         dbg("[SEEK/DIRECT] missing SEEK_URL")
         return []
 
-    from playwright.sync_api import sync_playwright
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ModuleNotFoundError as e:
+        dbg("[SEEK/DIRECT] Playwright not installed in image", str(e))
+        raise
 
     dbg("[SEEK/DIRECT] fetch begin", {"url": SEEK_URL})
     out = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ])
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -240,18 +242,27 @@ def scrape_seek_direct():
             viewport={"width": 1380, "height": 1800},
         )
         page = ctx.new_page()
-        page.goto(SEEK_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Cookie pop-up best-effort
         try:
-            page.get_by_role("button", name=re.compile("accept|agree|got it", re.I)).click(timeout=3000)
+            page.goto(SEEK_URL, wait_until="domcontentloaded", timeout=60000)
+        except PWTimeout:
+            dbg("[SEEK/DIRECT] timeout on goto")
+            png = page.screenshot(full_page=True)
+            upload_with_msi(png, f"{_report_folder()}/seek_screenshot.png", content_type="image/png")
+            ctx.close(); browser.close()
+            return []
+
+        # Try cookie/consent popups
+        try:
+            page.get_by_role("button", name=re.compile("accept|agree|got it|okay|ok", re.I)).click(timeout=2500)
         except Exception:
             pass
 
-        page.wait_for_timeout(1500)
+        # Basic anti-bot: small wait + scroll
+        page.wait_for_timeout(1000 + random.randint(0, 1200))
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1200)
 
-        # Try to find cards. SEEK often uses data-automation attributes.
-        # Prefer specific selectors, fall back to generic anchors.
+        # Candidate job-card selectors
         card_sel_variants = [
             "article[data-automation='normalJob']",
             "[data-automation='job-card']",
@@ -259,38 +270,39 @@ def scrape_seek_direct():
         ]
         job_cards = None
         for sel in card_sel_variants:
-            count = page.locator(sel).count()
-            if count > 0:
-                job_cards = (sel, count)
-                break
+            try:
+                count = page.locator(sel).count()
+                if count > 0:
+                    job_cards = (sel, count)
+                    break
+            except Exception:
+                continue
 
         if not job_cards:
-            # Screenshot to Blob for debugging if you like (optional)
-            dbg("[SEEK/DIRECT] no cards found; taking screenshot")
+            dbg("[SEEK/DIRECT] no cards found; uploading screenshot")
             try:
-                page.screenshot(path="/tmp/seek_search.png", full_page=True)
-            except Exception:
-                pass
+                png = page.screenshot(full_page=True)
+                upload_with_msi(png, f"{_report_folder()}/seek_screenshot.png", content_type="image/png")
+            except Exception as e:
+                dbg("[SEEK/DIRECT] screenshot upload failed", str(e))
             ctx.close(); browser.close()
             return []
 
         sel, count = job_cards
         dbg("[SEEK/DIRECT] card selector", {"selector": sel, "count": count})
 
-        for i in range(min(count, 100)):
+        for i in range(min(count, 120)):
             try:
                 card = page.locator(sel).nth(i)
 
                 # title
                 title = ""
                 try:
-                    # common title selector
-                    title = card.locator("[data-automation='jobTitle']").inner_text(timeout=2000).strip()
+                    title = card.locator("[data-automation='jobTitle']").inner_text(timeout=1800).strip()
                 except Exception:
-                    # fallback to first <a>
                     links = card.locator("a[href*='/job/']")
                     if links.count() > 0:
-                        title = (links.first.inner_text(timeout=1500) or "").strip()
+                        title = (links.first.inner_text(timeout=1200) or "").strip()
 
                 if not title or not title_hits(title):
                     continue
@@ -306,28 +318,26 @@ def scrape_seek_direct():
                 full = "https://www.seek.com.au" + href if href.startswith("/") else href
 
                 # company
-                company = ""
+                company = "Seek Listing"
                 try:
-                    company = card.locator("[data-automation='jobCompany']").inner_text(timeout=1500).strip()
+                    company = (card.locator("[data-automation='jobCompany']").inner_text(timeout=1200) or "Seek Listing").strip()
                 except Exception:
-                    company = "Seek Listing"
+                    pass
 
-                # location (scope filter)
+                # location (scope)
                 location = ""
                 try:
-                    location = card.locator("[data-automation='jobLocation']").inner_text(timeout=1500).strip()
+                    location = (card.locator("[data-automation='jobLocation']").inner_text(timeout=1200) or "").strip()
                 except Exception:
-                    pass
-                if CITY_FILTER and not in_sydney_scope(location):
-                    # Still allow; your URL already filters Sydney, but keep this to be safe
                     pass
 
-                # listed/posted
+                # listed date
                 listed_text = ""
                 try:
-                    listed_text = card.locator("[data-automation='jobListingDate']").inner_text(timeout=1500).strip()
+                    listed_text = (card.locator("[data-automation='jobListingDate']").inner_text(timeout=1200) or "").strip()
                 except Exception:
                     pass
+
                 posted_dt = _parse_seek_listed_to_dt(listed_text)
                 if posted_dt < SINCE:
                     continue
@@ -336,7 +346,7 @@ def scrape_seek_direct():
                 score = alignment_score(title, "", sector, posted_dt)
                 out.append(row(
                     role=title,
-                    company=company or "Seek Listing",
+                    company=company,
                     source_url=full,
                     posted_dt=posted_dt,
                     engagement=engagement_type(title),
@@ -352,6 +362,25 @@ def scrape_seek_direct():
         browser.close()
 
     dbg("[SEEK/DIRECT] final rows", {"count": len(out)})
+    if not out:
+        # No rows but page loaded; save screenshot for inspection
+        try:
+            # Re-open a quick session to capture again (last resort)
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                b = p.chromium.launch(headless=True)
+                c = b.new_context(viewport={"width": 1380, "height": 1800})
+                pg = c.new_page()
+                try:
+                    pg.goto(SEEK_URL, wait_until="domcontentloaded", timeout=30000)
+                    pg.wait_for_timeout(1200)
+                    png = pg.screenshot(full_page=True)
+                    upload_with_msi(png, f"{_report_folder()}/seek_screenshot.png", content_type="image/png")
+                except Exception:
+                    pass
+                c.close(); b.close()
+        except Exception:
+            pass
     return out
 
 # ----------------------------------------------------------------------------
@@ -359,15 +388,15 @@ def scrape_seek_direct():
 SCRAPERS = {
     "seek": scrape_seek,
     "indeed": scrape_indeed,
-    "seek_direct": scrape_seek_direct,  # <-- new, uses your full URL
-    # "adzuna": scrape_adzuna,      # if you add the API path
+    "seek_direct": scrape_seek_direct,  # Playwright path
+    # "adzuna": scrape_adzuna,          # if you add API path later
 }
 
 def dedupe(rows):
     seen = set(); out = []
     for r in rows:
         key = (r["Role"].lower(), r["Company/Agency"].lower(), r["Source (with link)"])
-        if key in seen: 
+        if key in seen:
             continue
         seen.add(key); out.append(r)
     return out
@@ -396,12 +425,25 @@ def upload_with_msi(local_bytes: bytes, path: str, content_type: str = "text/csv
     dbg("[BLOB] uploaded", {"path": path, "bytes": len(local_bytes)})
 
 def main():
+    # sanity: unknown sources notice
+    KNOWN = set(SCRAPERS.keys())
+    unknown = [s for s in SOURCES if s not in KNOWN]
+    if unknown:
+        dbg("[CFG] unknown sources requested", {"unknown": unknown})
+
     all_rows = []
     per_source = {}
 
     # If SOURCES is empty, run all; else restrict to provided set
     selected = set(SOURCES) if SOURCES else set(SCRAPERS.keys())
     dbg("[RUN] selected sources", list(selected))
+
+    # Build filenames/folder up-front so helpers can reuse
+    folder = f"{REPORT_PREFIX}/{UTC_NOW.strftime('%Y-%m-%d')}"
+    csv_name = f"{folder}/report.csv"
+    html_name = f"{folder}/report.html"
+    debug_name = f"{folder}/debug.json"
+    title = f"Sydney Data Leadership Intelligence Report — {datetime.now().strftime('%d %B %Y')} (08:30 Sydney)"
 
     for key, fn in SCRAPERS.items():
         if key not in selected:
@@ -429,21 +471,13 @@ def main():
         df["Posting Date Sort"] = pd.to_datetime(df["Posting Date"], errors="coerce")
         df = df.sort_values(by=["ScoreInt","Posting Date Sort"], ascending=[False, False]).drop(columns=["ScoreInt","Posting Date Sort"])
 
-    # Filenames
-    local_date = UTC_NOW.astimezone(timezone.utc)
-    folder = f"{REPORT_PREFIX}/{local_date.strftime('%Y-%m-%d')}"
-    csv_name = f"{folder}/report.csv"
-    html_name = f"{folder}/report.html"
-    debug_name = f"{folder}/debug.json"
-    title = f"Sydney Data Leadership Intelligence Report — {datetime.now().strftime('%d %B %Y')} (08:30 Sydney)"
-
     csv_bytes = df.to_csv(index=False).encode("utf-8") if not df.empty else b""
     html_bytes = (
         to_html_table(df, title).encode("utf-8")
         if not df.empty else "<p>No matching roles today.</p>".encode("utf-8")
     )
 
-    # Small debug artifact so we can see what's happening even if CSV is empty
+    # Debug artifact (always written)
     summary = {
         "since_utc": SINCE.isoformat(),
         "now_utc": UTC_NOW.isoformat(),
@@ -482,4 +516,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

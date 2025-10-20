@@ -54,6 +54,8 @@ STORAGE_CONTAINER = os.getenv("STORAGE_CONTAINER", "reports")
 UTC_NOW = datetime.now(timezone.utc)
 SINCE = UTC_NOW - timedelta(days=TIME_WINDOW_DAYS)
 
+SEEK_URL = os.getenv("SEEK_URL")  # e.g. https://www.seek.com.au/head-of-data-jobs/in-All-Sydney-NSW?daterange=3&tags=new
+
 dbg("[CFG] starting run", {
     "city": CITY_FILTER,
     "window_days": TIME_WINDOW_DAYS,
@@ -194,12 +196,171 @@ def scrape_indeed():
 
     dbg("[INDEED] final rows", {"count": len(out)})
     return out
+
+def _parse_seek_listed_to_dt(text: str):
+    """
+    Convert strings like 'Listed 2 days ago', 'Listed 1 day ago', 'Listed today', 'Just posted'
+    into an approximate datetime in UTC. If unknown, return UTC_NOW.
+    """
+    t = (text or "").lower()
+    try:
+        if "just" in t or "today" in t:
+            return UTC_NOW
+        m = re.search(r"listed\s+(\d+)\s+day", t)
+        if m:
+            days = int(m.group(1))
+            return UTC_NOW - timedelta(days=days)
+    except:
+        pass
+    return UTC_NOW
+
+def scrape_seek_direct():
+    """
+    Loads a FULL SEEK search URL (provided via SEEK_URL) with Playwright and parses cards.
+    Works on URLs like:
+      https://www.seek.com.au/head-of-data-jobs/in-All-Sydney-NSW?daterange=3&tags=new
+    Notes:
+      - We don’t click into detail pages (keeps it fast & less bot-like).
+      - We try several common selectors; SEEK tweaks markup often.
+    """
+    if not SEEK_URL:
+        dbg("[SEEK/DIRECT] missing SEEK_URL")
+        return []
+
+    from playwright.sync_api import sync_playwright
+
+    dbg("[SEEK/DIRECT] fetch begin", {"url": SEEK_URL})
+    out = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            locale="en-AU",
+            viewport={"width": 1380, "height": 1800},
+        )
+        page = ctx.new_page()
+        page.goto(SEEK_URL, wait_until="domcontentloaded", timeout=60000)
+
+        # Cookie pop-up best-effort
+        try:
+            page.get_by_role("button", name=re.compile("accept|agree|got it", re.I)).click(timeout=3000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(1500)
+
+        # Try to find cards. SEEK often uses data-automation attributes.
+        # Prefer specific selectors, fall back to generic anchors.
+        card_sel_variants = [
+            "article[data-automation='normalJob']",
+            "[data-automation='job-card']",
+            "article",  # fallback
+        ]
+        job_cards = None
+        for sel in card_sel_variants:
+            count = page.locator(sel).count()
+            if count > 0:
+                job_cards = (sel, count)
+                break
+
+        if not job_cards:
+            # Screenshot to Blob for debugging if you like (optional)
+            dbg("[SEEK/DIRECT] no cards found; taking screenshot")
+            try:
+                page.screenshot(path="/tmp/seek_search.png", full_page=True)
+            except Exception:
+                pass
+            ctx.close(); browser.close()
+            return []
+
+        sel, count = job_cards
+        dbg("[SEEK/DIRECT] card selector", {"selector": sel, "count": count})
+
+        for i in range(min(count, 100)):
+            try:
+                card = page.locator(sel).nth(i)
+
+                # title
+                title = ""
+                try:
+                    # common title selector
+                    title = card.locator("[data-automation='jobTitle']").inner_text(timeout=2000).strip()
+                except Exception:
+                    # fallback to first <a>
+                    links = card.locator("a[href*='/job/']")
+                    if links.count() > 0:
+                        title = (links.first.inner_text(timeout=1500) or "").strip()
+
+                if not title or not title_hits(title):
+                    continue
+
+                # href
+                href = ""
+                try:
+                    href = card.locator("a[href*='/job/']").first.get_attribute("href") or ""
+                except Exception:
+                    pass
+                if not href:
+                    continue
+                full = "https://www.seek.com.au" + href if href.startswith("/") else href
+
+                # company
+                company = ""
+                try:
+                    company = card.locator("[data-automation='jobCompany']").inner_text(timeout=1500).strip()
+                except Exception:
+                    company = "Seek Listing"
+
+                # location (scope filter)
+                location = ""
+                try:
+                    location = card.locator("[data-automation='jobLocation']").inner_text(timeout=1500).strip()
+                except Exception:
+                    pass
+                if CITY_FILTER and not in_sydney_scope(location):
+                    # Still allow; your URL already filters Sydney, but keep this to be safe
+                    pass
+
+                # listed/posted
+                listed_text = ""
+                try:
+                    listed_text = card.locator("[data-automation='jobListingDate']").inner_text(timeout=1500).strip()
+                except Exception:
+                    pass
+                posted_dt = _parse_seek_listed_to_dt(listed_text)
+                if posted_dt < SINCE:
+                    continue
+
+                sector = "edge-case/other"
+                score = alignment_score(title, "", sector, posted_dt)
+                out.append(row(
+                    role=title,
+                    company=company or "Seek Listing",
+                    source_url=full,
+                    posted_dt=posted_dt,
+                    engagement=engagement_type(title),
+                    status="Active",
+                    sector=sector,
+                    rationale="SEEK search URL; leadership title match",
+                    score=score
+                ))
+            except Exception:
+                continue
+
+        ctx.close()
+        browser.close()
+
+    dbg("[SEEK/DIRECT] final rows", {"count": len(out)})
+    return out
+
 # ----------------------------------------------------------------------------
 
 SCRAPERS = {
     "seek": scrape_seek,
     "indeed": scrape_indeed,
-    # TODO: add the rest of the sites following the same pattern.
+    "seek_direct": scrape_seek_direct,  # <-- new, uses your full URL
+    # "adzuna": scrape_adzuna,      # if you add the API path
 }
 
 def dedupe(rows):
@@ -321,3 +482,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
